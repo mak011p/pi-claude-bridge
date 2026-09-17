@@ -433,6 +433,34 @@ function resultErrorText(message: SDKMessage): string | undefined {
 	return `Claude Code failed: ${result.subtype ?? "unknown result"}`;
 }
 
+/** A reset instant as an absolute local date-time plus a relative distance.
+ *
+ *  toLocaleTimeString() renders time of day only, so a seven-day window that
+ *  reopens on Sunday and one that reopens tonight both print "9:00:00 PM". The
+ *  weekly buckets are the ones users actually wait on, which made the only
+ *  number in the message the one that could not be acted on. */
+function describeReset(epochSeconds: number | undefined, now = Date.now()): string {
+	if (!epochSeconds) return "unknown";
+	const when = new Date(epochSeconds * 1000);
+	const stamp = when.toLocaleString(undefined, {
+		weekday: "short", day: "numeric", month: "short", hour: "numeric", minute: "2-digit",
+	});
+	const hours = (when.getTime() - now) / 3_600_000;
+	if (hours <= 0) return `${stamp} (now)`;
+	const rel = hours < 1 ? `${Math.round(hours * 60)}m`
+		: hours < 48 ? `${Math.round(hours)}h`
+		: `${Math.round(hours / 24)}d`;
+	return `${stamp} (in ${rel})`;
+}
+
+/** The limit is scoped to the model that was requested — the server's own text
+ *  says "Switch to another model to continue" — but the type alone
+ *  ("seven_day_overage_included") reads as the whole account. Name the model so
+ *  the reader can tell an exhausted Opus week from an exhausted everything. */
+function describeRateLimitScope(model?: Model<any>): string {
+	return model?.id ? ` on ${model.id}` : "";
+}
+
 /** Name a failure as a rate limit when a rejection preceded it.
  *
  *  pi has no typed rate-limit error — `stopReason` is only ever `"error"` and the sole carrier
@@ -445,10 +473,14 @@ function resultErrorText(message: SDKMessage): string | undefined {
  *  Leading with "Claude rate limit" rather than appending keeps the phrase in any truncated
  *  render, and avoids the `<tool> failed (exit N):` shape that pi-subagents treats as a tool
  *  failure and refuses to retry. */
-function describeRateLimitFailure(rejection: { rateLimitType?: string; resetsAt?: number }, failure: string): string {
+function describeRateLimitFailure(
+	rejection: { rateLimitType?: string; resetsAt?: number; overageDisabledReason?: string },
+	failure: string,
+	model?: Model<any>,
+): string {
 	const kind = rejection.rateLimitType ? ` (${rejection.rateLimitType})` : "";
-	const resets = rejection.resetsAt ? ` — resets ${new Date(rejection.resetsAt * 1000).toLocaleTimeString()}` : "";
-	return `Claude rate limit${kind}${resets}: ${failure}`;
+	const resets = rejection.resetsAt ? ` — resets ${describeReset(rejection.resetsAt)}` : "";
+	return `Claude rate limit${describeRateLimitScope(model)}${kind}${resets}: ${failure}`;
 }
 
 function isolatedStreamFn(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
@@ -1293,7 +1325,7 @@ async function consumeQuery(
 				// Consume the rejection alongside the failure it caused, so a later
 				// unrelated failure on this query doesn't inherit the label.
 				if (queryCtx.rateLimitRejection) {
-					resultError = describeRateLimitFailure(queryCtx.rateLimitRejection, resultError);
+					resultError = describeRateLimitFailure(queryCtx.rateLimitRejection, resultError, model);
 					queryCtx.rateLimitRejection = null;
 				}
 				debug(`consumeQuery: error result, subtype=${message.subtype}, error=${resultError}`);
@@ -1314,8 +1346,14 @@ async function consumeQuery(
 				queryCtx.lastRateLimitWarnStep = null;
 				queryCtx.lastRateLimitWarnThreshold = undefined;
 				// resetsAt is Unix seconds, not milliseconds.
-				const resetsAt = info.resetsAt ? new Date(info.resetsAt * 1000).toLocaleTimeString() : "unknown";
-				piUI?.notify(`Claude rate limited (${info.rateLimitType ?? "unknown"}) — resets at ${resetsAt}`, "warning");
+				const resetsAt = describeReset(info.resetsAt);
+				// Without this the reader cannot tell why a limit they have not hit is
+				// rejecting them: the weekly bucket is spent AND overage cannot cover it.
+				const overage = info.overageStatus === "rejected" && info.overageDisabledReason
+					? `; extra usage unavailable (${info.overageDisabledReason})` : "";
+				piUI?.notify(
+					`Claude rate limited${describeRateLimitScope(model)} (${info.rateLimitType ?? "unknown"})`
+					+ ` — resets ${resetsAt}${overage}`, "warning");
 			} else if (info?.status === "allowed") {
 				// Back under the threshold (window reset) — re-arm the warning dedupe.
 				queryCtx.lastRateLimitWarnStep = null;
