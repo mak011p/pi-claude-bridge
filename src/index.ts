@@ -1368,7 +1368,13 @@ async function consumeQuery(
 				if (rose || info.surpassedThreshold !== queryCtx.lastRateLimitWarnThreshold) {
 					queryCtx.lastRateLimitWarnStep = step;
 					queryCtx.lastRateLimitWarnThreshold = info.surpassedThreshold;
-					piUI?.notify(`Claude rate limit warning: ${percent}% used (${info.rateLimitType ?? ""})`, "warning");
+					// Same reasoning as the rejection notice above: a percentage without a
+					// date says the week is going, not when it comes back, and the model
+					// scope separates an exhausting Opus week from the whole account.
+					piUI?.notify(
+						`Claude rate limit warning${describeRateLimitScope(model)}:`
+						+ ` ${percent}% used (${info.rateLimitType ?? "unknown"})`
+						+ ` — resets ${describeReset(info.resetsAt)}`, "warning");
 				}
 			}
 			continue;
