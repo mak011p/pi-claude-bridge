@@ -12,6 +12,22 @@ import { createSession, deleteSession, openSession } from "cc-session-io";
 const { __test } = await import("../src/index.js");
 
 describe("syncSharedSession", () => {
+	it("starts fresh when prior messages import no records", () => {
+		const cwd = mkdtempSync(join(tmpdir(), "sync-empty-"));
+		const notices = [];
+		try {
+			__test.setPiUI({ notify: (message) => notices.push(message) });
+			const result = __test.syncSharedSession([
+				{ role: "assistant", content: [], timestamp: 2 },
+				{ role: "user", content: "Hello", timestamp: 3 },
+			], cwd);
+			assert.equal(result.sessionId, null);
+			assert.equal(__test.getSharedSession(), null);
+			assert.deepEqual(notices, []);
+		} finally {
+			rmSync(cwd, { recursive: true, force: true });
+		}
+	});
 	afterEach(() => {
 		__test.resetSharedSession();
 		__test.setPiUI(null);

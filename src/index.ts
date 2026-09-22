@@ -26,6 +26,7 @@ import {
 import { collectCarriedAttachments, placeCarriedAttachments, type CarriedAttachment } from "./attachments.js";
 import { createToolServer } from "./mcp-server.js";
 import { buildActionSummary, type ToolCallState } from "./askclaude-ui.js";
+import { appendDiagnostic } from "./diagnostics.js";
 
 // Compat (#2): use factory if available (pi-ai ≥0.66), else fall back to constructor (gsd-pi etc.)
 const _piAi = piAi as any;
@@ -35,11 +36,12 @@ const newAssistantMessageEventStream: () => AssistantMessageEventStream =
 		: () => new _piAi.AssistantMessageEventStream();
 
 // --- Debug logging ---
-// CLAUDE_BRIDGE_DEBUG=1 enables debug logging to ~/.pi/agent/claude-bridge.log
+// CLAUDE_BRIDGE_DEBUG=1 enables debug logging under Pi's temporary state.
 
 const DEBUG = process.env.CLAUDE_BRIDGE_DEBUG === "1";
-const DEBUG_LOG_PATH = process.env.CLAUDE_BRIDGE_DEBUG_PATH || join(homedir(), ".pi", "agent", "claude-bridge.log");
-const DIAG_LOG_PATH = join(homedir(), ".pi", "agent", "claude-bridge-diag.log");
+const LOG_DIR = join(process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent"), "tmp", "claude-bridge");
+const DEBUG_LOG_PATH = process.env.CLAUDE_BRIDGE_DEBUG_PATH || join(LOG_DIR, "claude-bridge.log");
+const DIAG_LOG_PATH = process.env.CLAUDE_BRIDGE_DIAG_PATH || join(dirname(DEBUG_LOG_PATH), "claude-bridge-diag.log");
 
 // CLAUDE_BRIDGE_RECORD_STREAM=<path> appends every SDK message consumeQuery sees,
 // one JSON object per line. Used by tests/lib/record-sdk-streams.mjs to capture
@@ -73,16 +75,6 @@ const CC_CHILD_ENV = {
 // while rules need their own. Managed/policy memory is not excludable by design.
 const CLAUDE_MD_EXCLUDES = ["**/CLAUDE.md", "**/.claude/rules/**"];
 
-// Ensure log directories exist when debug is enabled
-if (DEBUG) {
-	try {
-		mkdirSync(dirname(DEBUG_LOG_PATH), { recursive: true });
-		mkdirSync(dirname(DIAG_LOG_PATH), { recursive: true });
-	} catch {
-		// If directory creation fails, debug functions will throw on first use
-	}
-}
-
 // Unique per module evaluation — confirms whether subagents share module state
 const moduleInstanceId = Math.random().toString(36).slice(2, 8);
 
@@ -95,7 +87,7 @@ function debug(...args: unknown[]) {
 		return JSON.stringify(a);
 	};
 	const msg = args.map(fmt).join(" ");
-	appendFileSync(DEBUG_LOG_PATH, `[${ts}] [${moduleInstanceId}] ${msg}\n`);
+	appendDiagnostic(DEBUG_LOG_PATH, `[${ts}] [${moduleInstanceId}] ${msg}\n`);
 }
 
 // Per-query CLI debug capture. When CLAUDE_BRIDGE_DEBUG=1, ask the Claude Code
@@ -128,7 +120,7 @@ function makeCliDebugOptions(tag: string): { debug?: boolean; debugFile?: string
 function diagDump(label: string, data: Record<string, unknown>) {
 	const ts = new Date().toISOString();
 	const entry = { ts, moduleInstanceId, label, ...data };
-	appendFileSync(DIAG_LOG_PATH, JSON.stringify(entry) + "\n");
+	appendDiagnostic(DIAG_LOG_PATH, JSON.stringify(entry) + "\n");
 	debug(`DIAG: ${label} (see ${DIAG_LOG_PATH})`);
 }
 
@@ -755,6 +747,11 @@ function syncSharedSession(
 		...(modelId ? { model: modelId } : {}),
 	});
 	convertAndImportMessages(session, priorMessages, customToolNameToSdk, carried);
+	if (session.records.length === 0) {
+		// cc-session-io does not create a file for an empty import. Do not resume it.
+		sharedSession = null;
+		return { sessionId: null };
+	}
 	session.save();
 	// records, not messages: `messages` filters out the attachment records that
 	// carrying an `@file` expansion across a rebuild writes into the same file.
