@@ -16,6 +16,7 @@ import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, renderSkillsBlock } from "./skills.js
 import { verifyWrittenSession as _verifyWrittenSession } from "./session-verify.js";
 import { extractAllToolResults as _extractAllToolResults, type McpResult } from "./extract-tool-results.js";
 import { QueryContext, ctx } from "./query-state.js";
+import { projectProviderContext } from "./provider-context.js";
 import { makePromptStream, userMessage, type PromptStream } from "./prompt-stream.js";
 import { claudeCodeSettings, loadConfig, markStartupNoticeShown, type Config } from "./config.js";
 import {
@@ -496,6 +497,7 @@ async function runIsolatedSummary(
 	};
 
 	try {
+		context = projectProviderContext(context);
 		const promptText = extractIsolatedSummaryPrompt(context.messages);
 		const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
 		const compactProviderSettings = loadConfig(cwd).provider;
@@ -1520,6 +1522,7 @@ function drainForAbort(c: QueryContext, promptStream: PromptStream): void {
 function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
 	showStartupNoticeOnce();
 	const stream = newAssistantMessageEventStream();
+	context = projectProviderContext(context);
 
 	// DEBUG: trace followUp message triggering
 	const lastMsgRole = context.messages[context.messages.length - 1]?.role;
