@@ -68,9 +68,9 @@ const CC_CHILD_ENV = {
 // running — arrives at all, stamped "These instructions OVERRIDE any default
 // behavior" and outranking Pi's own AGENTS.md.
 //
-// Excludes rather than settingSources: the source gate that suppresses CLAUDE.md
-// is the same one that reads settings.json, where Bedrock/Vertex users keep
-// `env` and `apiKeyHelper`. Patterns are matched with picomatch against absolute
+// The queries below also pass settingSources: [], which reads no settings file
+// and so no CLAUDE.md either; these excludes stay as a second line should a
+// source be re-enabled. Patterns are matched with picomatch against absolute
 // paths; "**/CLAUDE.md" covers the user, ancestor, project and .claude/ copies,
 // while rules need their own. Managed/policy memory is not excludable by design.
 const CLAUDE_MD_EXCLUDES = ["**/CLAUDE.md", "**/.claude/rules/**"];
@@ -1652,8 +1652,8 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// MCP auto-loading suppression: CC reads MCP servers from ~/.claude.json (top-level
 	// + per-project) and .mcp.json. Since pi executes tools (not CC), those are pure
 	// token overhead. --strict-mcp-config tells the binary to use ONLY mcpServers passed
-	// programmatically and ignore filesystem MCP entries — applied unconditionally because
-	// settingSources is left at CC's default, which loads all sources.
+	// programmatically and ignore filesystem MCP entries — applied unconditionally, as
+	// ~/.claude.json is read whatever settingSources says.
 	const strictMcpConfigEnabled = providerSettings.strictMcpConfig !== false;
 	const claudeExecutable = providerSettings.pathToClaudeCodeExecutable;
 
@@ -1702,6 +1702,11 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			claudeMdExcludes: CLAUDE_MD_EXCLUDES,
 			includeGitInstructions: false,
 		},
+		// No settings file is read: everything CC needs arrives in `settings` above.
+		// CC's default loads user, project and local sources, so a repository's
+		// .claude/settings.json, or one planted in the writable CLAUDE_CONFIG_DIR,
+		// could add hooks or command helpers that run outside pi's tool checks.
+		settingSources: [] as SettingSource[],
 		systemPrompt: {
 			type: "preset", preset: "claude_code",
 			append: systemPromptAppend ? systemPromptAppend : undefined,
@@ -1930,7 +1935,9 @@ async function promptAndWait(
 			// without the tool and permission guidance the bridge relies on everywhere else.
 			// Whether pi has skills to append is unrelated to whether the child needs that.
 			systemPrompt: { type: "preset", preset: "claude_code", append: skillsBlock },
-			settingSources: ["user", "project"] as SettingSource[],
+			// No settings file is read, as on the provider path: a repository's
+			// .claude/settings.json could otherwise add hooks to this child.
+			settingSources: [] as SettingSource[],
 			extraArgs,
 			...(resumeSessionId ? { resume: resumeSessionId } : {}),
 			...(options?.isolated ? { persistSession: false } : {}),
