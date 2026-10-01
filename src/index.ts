@@ -16,6 +16,7 @@ import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, renderSkillsBlock } from "./skills.js
 import { verifyWrittenSession as _verifyWrittenSession } from "./session-verify.js";
 import { extractAllToolResults as _extractAllToolResults, type McpResult } from "./extract-tool-results.js";
 import { QueryContext, ctx } from "./query-state.js";
+import { projectProviderContext } from "./provider-context.js";
 import { makePromptStream, userMessage, type PromptStream } from "./prompt-stream.js";
 import { claudeCodeSettings, loadConfig, markStartupNoticeShown, type Config } from "./config.js";
 import {
@@ -26,6 +27,7 @@ import {
 import { collectCarriedAttachments, placeCarriedAttachments, type CarriedAttachment } from "./attachments.js";
 import { createToolServer } from "./mcp-server.js";
 import { buildActionSummary, type ToolCallState } from "./askclaude-ui.js";
+import { appendDiagnostic } from "./diagnostics.js";
 
 // Compat (#2): use factory if available (pi-ai ≥0.66), else fall back to constructor (gsd-pi etc.)
 const _piAi = piAi as any;
@@ -35,11 +37,12 @@ const newAssistantMessageEventStream: () => AssistantMessageEventStream =
 		: () => new _piAi.AssistantMessageEventStream();
 
 // --- Debug logging ---
-// CLAUDE_BRIDGE_DEBUG=1 enables debug logging to ~/.pi/agent/claude-bridge.log
+// CLAUDE_BRIDGE_DEBUG=1 enables debug logging under Pi's temporary state.
 
 const DEBUG = process.env.CLAUDE_BRIDGE_DEBUG === "1";
-const DEBUG_LOG_PATH = process.env.CLAUDE_BRIDGE_DEBUG_PATH || join(homedir(), ".pi", "agent", "claude-bridge.log");
-const DIAG_LOG_PATH = join(homedir(), ".pi", "agent", "claude-bridge-diag.log");
+const LOG_DIR = join(process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent"), "tmp", "claude-bridge");
+const DEBUG_LOG_PATH = process.env.CLAUDE_BRIDGE_DEBUG_PATH || join(LOG_DIR, "claude-bridge.log");
+const DIAG_LOG_PATH = process.env.CLAUDE_BRIDGE_DIAG_PATH || join(dirname(DEBUG_LOG_PATH), "claude-bridge-diag.log");
 
 // CLAUDE_BRIDGE_RECORD_STREAM=<path> appends every SDK message consumeQuery sees,
 // one JSON object per line. Used by tests/lib/record-sdk-streams.mjs to capture
@@ -66,22 +69,12 @@ const CC_CHILD_ENV = {
 // running — arrives at all, stamped "These instructions OVERRIDE any default
 // behavior" and outranking Pi's own AGENTS.md.
 //
-// Excludes rather than settingSources: the source gate that suppresses CLAUDE.md
-// is the same one that reads settings.json, where Bedrock/Vertex users keep
-// `env` and `apiKeyHelper`. Patterns are matched with picomatch against absolute
+// The queries below also pass settingSources: [], which reads no settings file
+// and so no CLAUDE.md either; these excludes stay as a second line should a
+// source be re-enabled. Patterns are matched with picomatch against absolute
 // paths; "**/CLAUDE.md" covers the user, ancestor, project and .claude/ copies,
 // while rules need their own. Managed/policy memory is not excludable by design.
 const CLAUDE_MD_EXCLUDES = ["**/CLAUDE.md", "**/.claude/rules/**"];
-
-// Ensure log directories exist when debug is enabled
-if (DEBUG) {
-	try {
-		mkdirSync(dirname(DEBUG_LOG_PATH), { recursive: true });
-		mkdirSync(dirname(DIAG_LOG_PATH), { recursive: true });
-	} catch {
-		// If directory creation fails, debug functions will throw on first use
-	}
-}
 
 // Unique per module evaluation — confirms whether subagents share module state
 const moduleInstanceId = Math.random().toString(36).slice(2, 8);
@@ -95,7 +88,7 @@ function debug(...args: unknown[]) {
 		return JSON.stringify(a);
 	};
 	const msg = args.map(fmt).join(" ");
-	appendFileSync(DEBUG_LOG_PATH, `[${ts}] [${moduleInstanceId}] ${msg}\n`);
+	appendDiagnostic(DEBUG_LOG_PATH, `[${ts}] [${moduleInstanceId}] ${msg}\n`);
 }
 
 // Per-query CLI debug capture. When CLAUDE_BRIDGE_DEBUG=1, ask the Claude Code
@@ -128,7 +121,7 @@ function makeCliDebugOptions(tag: string): { debug?: boolean; debugFile?: string
 function diagDump(label: string, data: Record<string, unknown>) {
 	const ts = new Date().toISOString();
 	const entry = { ts, moduleInstanceId, label, ...data };
-	appendFileSync(DIAG_LOG_PATH, JSON.stringify(entry) + "\n");
+	appendDiagnostic(DIAG_LOG_PATH, JSON.stringify(entry) + "\n");
 	debug(`DIAG: ${label} (see ${DIAG_LOG_PATH})`);
 }
 
@@ -433,6 +426,34 @@ function resultErrorText(message: SDKMessage): string | undefined {
 	return `Claude Code failed: ${result.subtype ?? "unknown result"}`;
 }
 
+/** A reset instant as an absolute local date-time plus a relative distance.
+ *
+ *  toLocaleTimeString() renders time of day only, so a seven-day window that
+ *  reopens on Sunday and one that reopens tonight both print "9:00:00 PM". The
+ *  weekly buckets are the ones users actually wait on, which made the only
+ *  number in the message the one that could not be acted on. */
+function describeReset(epochSeconds: number | undefined, now = Date.now()): string {
+	if (!epochSeconds) return "unknown";
+	const when = new Date(epochSeconds * 1000);
+	const stamp = when.toLocaleString(undefined, {
+		weekday: "short", day: "numeric", month: "short", hour: "numeric", minute: "2-digit",
+	});
+	const hours = (when.getTime() - now) / 3_600_000;
+	if (hours <= 0) return `${stamp} (now)`;
+	const rel = hours < 1 ? `${Math.round(hours * 60)}m`
+		: hours < 48 ? `${Math.round(hours)}h`
+		: `${Math.round(hours / 24)}d`;
+	return `${stamp} (in ${rel})`;
+}
+
+/** The limit is scoped to the model that was requested — the server's own text
+ *  says "Switch to another model to continue" — but the type alone
+ *  ("seven_day_overage_included") reads as the whole account. Name the model so
+ *  the reader can tell an exhausted Opus week from an exhausted everything. */
+function describeRateLimitScope(model?: Model<any>): string {
+	return model?.id ? ` on ${model.id}` : "";
+}
+
 /** Name a failure as a rate limit when a rejection preceded it.
  *
  *  pi has no typed rate-limit error — `stopReason` is only ever `"error"` and the sole carrier
@@ -445,10 +466,14 @@ function resultErrorText(message: SDKMessage): string | undefined {
  *  Leading with "Claude rate limit" rather than appending keeps the phrase in any truncated
  *  render, and avoids the `<tool> failed (exit N):` shape that pi-subagents treats as a tool
  *  failure and refuses to retry. */
-function describeRateLimitFailure(rejection: { rateLimitType?: string; resetsAt?: number }, failure: string): string {
+function describeRateLimitFailure(
+	rejection: { rateLimitType?: string; resetsAt?: number; overageDisabledReason?: string },
+	failure: string,
+	model?: Model<any>,
+): string {
 	const kind = rejection.rateLimitType ? ` (${rejection.rateLimitType})` : "";
-	const resets = rejection.resetsAt ? ` — resets ${new Date(rejection.resetsAt * 1000).toLocaleTimeString()}` : "";
-	return `Claude rate limit${kind}${resets}: ${failure}`;
+	const resets = rejection.resetsAt ? ` — resets ${describeReset(rejection.resetsAt)}` : "";
+	return `Claude rate limit${describeRateLimitScope(model)}${kind}${resets}: ${failure}`;
 }
 
 function isolatedStreamFn(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
@@ -472,6 +497,7 @@ async function runIsolatedSummary(
 	};
 
 	try {
+		context = projectProviderContext(context);
 		const promptText = extractIsolatedSummaryPrompt(context.messages);
 		const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
 		const compactProviderSettings = loadConfig(cwd).provider;
@@ -723,6 +749,11 @@ function syncSharedSession(
 		...(modelId ? { model: modelId } : {}),
 	});
 	convertAndImportMessages(session, priorMessages, customToolNameToSdk, carried);
+	if (session.records.length === 0) {
+		// cc-session-io does not create a file for an empty import. Do not resume it.
+		sharedSession = null;
+		return { sessionId: null };
+	}
 	session.save();
 	// records, not messages: `messages` filters out the attachment records that
 	// carrying an `@file` expansion across a rebuild writes into the same file.
@@ -1293,7 +1324,7 @@ async function consumeQuery(
 				// Consume the rejection alongside the failure it caused, so a later
 				// unrelated failure on this query doesn't inherit the label.
 				if (queryCtx.rateLimitRejection) {
-					resultError = describeRateLimitFailure(queryCtx.rateLimitRejection, resultError);
+					resultError = describeRateLimitFailure(queryCtx.rateLimitRejection, resultError, model);
 					queryCtx.rateLimitRejection = null;
 				}
 				debug(`consumeQuery: error result, subtype=${message.subtype}, error=${resultError}`);
@@ -1314,8 +1345,14 @@ async function consumeQuery(
 				queryCtx.lastRateLimitWarnStep = null;
 				queryCtx.lastRateLimitWarnThreshold = undefined;
 				// resetsAt is Unix seconds, not milliseconds.
-				const resetsAt = info.resetsAt ? new Date(info.resetsAt * 1000).toLocaleTimeString() : "unknown";
-				piUI?.notify(`Claude rate limited (${info.rateLimitType ?? "unknown"}) — resets at ${resetsAt}`, "warning");
+				const resetsAt = describeReset(info.resetsAt);
+				// Without this the reader cannot tell why a limit they have not hit is
+				// rejecting them: the weekly bucket is spent AND overage cannot cover it.
+				const overage = info.overageStatus === "rejected" && info.overageDisabledReason
+					? `; extra usage unavailable (${info.overageDisabledReason})` : "";
+				piUI?.notify(
+					`Claude rate limited${describeRateLimitScope(model)} (${info.rateLimitType ?? "unknown"})`
+					+ ` — resets ${resetsAt}${overage}`, "warning");
 			} else if (info?.status === "allowed") {
 				// Back under the threshold (window reset) — re-arm the warning dedupe.
 				queryCtx.lastRateLimitWarnStep = null;
@@ -1330,7 +1367,13 @@ async function consumeQuery(
 				if (rose || info.surpassedThreshold !== queryCtx.lastRateLimitWarnThreshold) {
 					queryCtx.lastRateLimitWarnStep = step;
 					queryCtx.lastRateLimitWarnThreshold = info.surpassedThreshold;
-					piUI?.notify(`Claude rate limit warning: ${percent}% used (${info.rateLimitType ?? ""})`, "warning");
+					// Same reasoning as the rejection notice above: a percentage without a
+					// date says the week is going, not when it comes back, and the model
+					// scope separates an exhausting Opus week from the whole account.
+					piUI?.notify(
+						`Claude rate limit warning${describeRateLimitScope(model)}:`
+						+ ` ${percent}% used (${info.rateLimitType ?? "unknown"})`
+						+ ` — resets ${describeReset(info.resetsAt)}`, "warning");
 				}
 			}
 			continue;
@@ -1479,6 +1522,7 @@ function drainForAbort(c: QueryContext, promptStream: PromptStream): void {
 function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
 	showStartupNoticeOnce();
 	const stream = newAssistantMessageEventStream();
+	context = projectProviderContext(context);
 
 	// DEBUG: trace followUp message triggering
 	const lastMsgRole = context.messages[context.messages.length - 1]?.role;
@@ -1611,8 +1655,8 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// MCP auto-loading suppression: CC reads MCP servers from ~/.claude.json (top-level
 	// + per-project) and .mcp.json. Since pi executes tools (not CC), those are pure
 	// token overhead. --strict-mcp-config tells the binary to use ONLY mcpServers passed
-	// programmatically and ignore filesystem MCP entries — applied unconditionally because
-	// settingSources is left at CC's default, which loads all sources.
+	// programmatically and ignore filesystem MCP entries — applied unconditionally, as
+	// ~/.claude.json is read whatever settingSources says.
 	const strictMcpConfigEnabled = providerSettings.strictMcpConfig !== false;
 	const claudeExecutable = providerSettings.pathToClaudeCodeExecutable;
 
@@ -1661,6 +1705,11 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			claudeMdExcludes: CLAUDE_MD_EXCLUDES,
 			includeGitInstructions: false,
 		},
+		// No settings file is read: everything CC needs arrives in `settings` above.
+		// CC's default loads user, project and local sources, so a repository's
+		// .claude/settings.json, or one planted in the writable CLAUDE_CONFIG_DIR,
+		// could add hooks or command helpers that run outside pi's tool checks.
+		settingSources: [] as SettingSource[],
 		systemPrompt: {
 			type: "preset", preset: "claude_code",
 			append: systemPromptAppend ? systemPromptAppend : undefined,
@@ -1889,7 +1938,9 @@ async function promptAndWait(
 			// without the tool and permission guidance the bridge relies on everywhere else.
 			// Whether pi has skills to append is unrelated to whether the child needs that.
 			systemPrompt: { type: "preset", preset: "claude_code", append: skillsBlock },
-			settingSources: ["user", "project"] as SettingSource[],
+			// No settings file is read, as on the provider path: a repository's
+			// .claude/settings.json could otherwise add hooks to this child.
+			settingSources: [] as SettingSource[],
 			extraArgs,
 			...(resumeSessionId ? { resume: resumeSessionId } : {}),
 			...(options?.isolated ? { persistSession: false } : {}),
