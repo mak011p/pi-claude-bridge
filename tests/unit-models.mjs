@@ -74,6 +74,7 @@ describe("MODELS projection", () => {
 
 describe("Claude Code runtime model policy", () => {
 	it("uses measured Pro defaults", () => {
+		assert.deepEqual(resolveClaudeCodeRuntimeModel("claude-opus-5-5", PRO), { cliModelId: "claude-opus-5-5[1m]", contextWindow: 1000000 });
 		assert.deepEqual(resolveClaudeCodeRuntimeModel("claude-opus-5", PRO), { cliModelId: "claude-opus-5[1m]", contextWindow: 1000000 });
 		assert.deepEqual(resolveClaudeCodeRuntimeModel("claude-opus-4-8", PRO), { cliModelId: "claude-opus-4-8[1m]", contextWindow: 1000000 });
 		assert.deepEqual(resolveClaudeCodeRuntimeModel("claude-opus-4-7", PRO), { cliModelId: "claude-opus-4-7", contextWindow: 1000000 });
@@ -83,6 +84,7 @@ describe("Claude Code runtime model policy", () => {
 	});
 
 	it("plan max only changes Opus 4.6", () => {
+		assert.deepEqual(resolveClaudeCodeRuntimeModel("claude-opus-5-5", MAX), { cliModelId: "claude-opus-5-5[1m]", contextWindow: 1000000 });
 		assert.deepEqual(resolveClaudeCodeRuntimeModel("claude-opus-5", MAX), { cliModelId: "claude-opus-5[1m]", contextWindow: 1000000 });
 		assert.deepEqual(resolveClaudeCodeRuntimeModel("claude-opus-4-8", MAX), { cliModelId: "claude-opus-4-8[1m]", contextWindow: 1000000 });
 		assert.deepEqual(resolveClaudeCodeRuntimeModel("claude-opus-4-7", MAX), { cliModelId: "claude-opus-4-7", contextWindow: 1000000 });
@@ -105,6 +107,7 @@ describe("claudeCodeModelId", () => {
 	const models = buildModels(MODEL_IDS_IN_ORDER.map(oneM));
 
 	it("returns the measured SDK request id", () => {
+		assert.equal(claudeCodeModelId(find(models, "claude-opus-5-5"), PRO), "claude-opus-5-5[1m]");
 		assert.equal(claudeCodeModelId(find(models, "claude-opus-5"), PRO), "claude-opus-5[1m]");
 		assert.equal(claudeCodeModelId(find(models, "claude-opus-4-8"), PRO), "claude-opus-4-8[1m]");
 		assert.equal(claudeCodeModelId(find(models, "claude-opus-4-7"), PRO), "claude-opus-4-7");
@@ -146,6 +149,7 @@ describe("applyLongContext", () => {
 
 	it("labels exactly the registered 1M models", () => {
 		const pro = applyLongContext(models, PRO);
+		assert.equal(find(pro, "claude-opus-5-5").name, "claude-opus-5-5 1M");
 		assert.equal(find(pro, "claude-opus-5").name, "claude-opus-5 1M");
 		assert.equal(find(pro, "claude-opus-4-8").name, "claude-opus-4-8 1M");
 		assert.equal(find(pro, "claude-opus-4-7").name, "claude-opus-4-7 1M");
@@ -161,8 +165,8 @@ describe("applyLongContext", () => {
 describe("resolveModel", () => {
 	const models = buildModels(MODEL_IDS_IN_ORDER.map(mockPiAiModel));
 
-	it("opus shortcut resolves to claude-opus-5 (first opus in order)", () => {
-		assert.equal(resolveModel(models, "opus")?.id, "claude-opus-5");
+	it("opus shortcut resolves to claude-opus-5-5 (first opus in order)", () => {
+		assert.equal(resolveModel(models, "opus")?.id, "claude-opus-5-5");
 	});
 
 	it("haiku shortcut resolves to claude-haiku-4-5", () => {
@@ -180,8 +184,8 @@ describe("resolveModel", () => {
 	it("returns the matched model object for CLI-arg conversion", () => {
 		const oneMModels = buildModels(MODEL_IDS_IN_ORDER.map(oneM));
 		const model = resolveModel(oneMModels, "opus");
-		assert.equal(model.id, "claude-opus-5");
-		assert.equal(claudeCodeModelId(model, PRO), "claude-opus-5[1m]");
+		assert.equal(model.id, "claude-opus-5-5");
+		assert.equal(claudeCodeModelId(model, PRO), "claude-opus-5-5[1m]");
 	});
 });
 
@@ -208,6 +212,14 @@ describe("models absent from pi-ai's snapshot", () => {
 		const real = { ...mockPiAiModel("claude-fable-5-1"), name: "Upstream Name" };
 		const models = buildModels([mockPiAiModel("claude-fable-5"), real]);
 		assert.equal(models.find((m) => m.id === "claude-fable-5-1").name, "Upstream Name");
+	});
+
+	it("derives Opus 5.5 from Opus 5 on a catalog that predates it (pi-ai 0.87.0)", () => {
+		const models = buildModels(["claude-opus-5", "claude-opus-4-8"].map(oneM));
+		assert.deepEqual(models.map((m) => m.id), ["claude-opus-5-5", "claude-opus-5", "claude-opus-4-8"]);
+		assert.equal(find(models, "claude-opus-5-5").name, "Claude Opus 5.5");
+		assert.equal(resolveModel(models, "opus")?.id, "claude-opus-5-5");
+		assert.equal(find(applyLongContext(models, MAX), "claude-opus-5-5").contextWindow, 1000000);
 	});
 
 	it("requests the 1M runtime id for Fable 5.1", () => {
