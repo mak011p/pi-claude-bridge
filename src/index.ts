@@ -484,9 +484,11 @@ function describeRateLimitScope(model?: Model<any>): string {
  *  6:30pm", which matches none of them, so an exhausted quota reads as a fatal error and the
  *  fallback chain never runs (issue #58).
  *
- *  Leading with "Claude rate limit" rather than appending keeps the phrase in any truncated
- *  render, and avoids the `<tool> failed (exit N):` shape that pi-subagents treats as a tool
- *  failure and refuses to retry. */
+ *  Leading with "Claude quota exceeded — rate limit" rather than appending keeps both phrases
+ *  in any truncated render, and avoids the `<tool> failed (exit N):` shape that pi-subagents
+ *  treats as a tool failure and refuses to retry. "quota exceeded" is on pi-ai's non-retryable
+ *  list, which wins over its retryable "rate limit" pattern, so pi hands the rejected window
+ *  straight to fallback instead of retrying a limit that resets in hours (issue #183). */
 function describeRateLimitFailure(
 	rejection: { rateLimitType?: string; resetsAt?: number; overageDisabledReason?: string },
 	failure: string,
@@ -494,7 +496,7 @@ function describeRateLimitFailure(
 ): string {
 	const kind = rejection.rateLimitType ? ` (${rejection.rateLimitType})` : "";
 	const resets = rejection.resetsAt ? ` — resets ${describeReset(rejection.resetsAt)}` : "";
-	return `Claude rate limit${describeRateLimitScope(model)}${kind}${resets}: ${failure}`;
+	return `Claude quota exceeded — rate limit${describeRateLimitScope(model)}${kind}${resets}: ${failure}`;
 }
 
 function isolatedStreamFn(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {

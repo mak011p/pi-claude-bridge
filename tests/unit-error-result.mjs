@@ -6,6 +6,7 @@
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { isRetryableAssistantError } from "@earendil-works/pi-ai";
 import { QueryContext } from "../src/query-state.js";
 
 const { __test } = await import("../src/index.js");
@@ -62,7 +63,7 @@ describe("resultErrorText", () => {
 // pi carries a failure only as errorMessage text, so every consumer that reacts to a rate
 // limit pattern-matches it. These mirror pi-subagents' gate (model-fallback.ts): one pattern
 // from its retryable list, and the tool-failure shape it refuses to retry.
-const RETRYABLE = /rate\s*limit/i;
+const RATE_LIMIT = /rate\s*limit/i;
 const TOOL_FAILURE_PREFIX = /^[\w.:@/-]+ failed (?:(?:\(exit \d+\):)|(?:with exit code \d+))(?:\s|$)/i;
 
 describe("a rate-limited failure", () => {
@@ -81,7 +82,8 @@ describe("a rate-limited failure", () => {
 		const c = makeCtx();
 		await consume(c, [rejection, limitResult]);
 
-		assert.match(c.turnOutput.errorMessage, RETRYABLE);
+		assert.match(c.turnOutput.errorMessage, RATE_LIMIT);
+		assert.equal(isRetryableAssistantError(c.turnOutput), false, "a rejected window is not retried as transient");
 		assert.doesNotMatch(c.turnOutput.errorMessage, TOOL_FAILURE_PREFIX);
 		assert.ok(c.turnOutput.errorMessage.includes(limitResult.result), "keeps Claude Code's own wording");
 		assert.ok(c.turnOutput.errorMessage.includes("five_hour"));
@@ -99,6 +101,26 @@ describe("a rate-limited failure", () => {
 		await consume(c, [errorResult]);
 		assert.strictEqual(c.turnOutput.errorMessage, errorResult.result);
 	});
+
+	// pi's default retry budget is 3 retries from a 2 s base delay, about 14 s in all, so
+	// no rejected window reopens inside it, whether it resets in days or in hours.
+	for (const [label, rateLimitType, seconds] of [
+		["three days away", "seven_day", 3 * 86400],
+		["two hours away", "five_hour", 2 * 3600],
+	]) {
+		it(`is not retried by pi when the window reopens ${label}`, async () => {
+			const c = makeCtx();
+			const resetsAt = Math.floor(Date.now() / 1000) + seconds;
+			await consume(c, [
+				{ type: "rate_limit_event", rate_limit_info: { status: "rejected", resetsAt, rateLimitType } },
+				limitResult,
+			]);
+
+			assert.match(c.turnOutput.errorMessage, RATE_LIMIT, "fallback chains (#58) still match");
+			assert.ok(c.turnOutput.errorMessage.includes(rateLimitType));
+			assert.equal(isRetryableAssistantError(c.turnOutput), false, c.turnOutput.errorMessage);
+		});
+	}
 });
 
 describe("error results", () => {
